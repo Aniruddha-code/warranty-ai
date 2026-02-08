@@ -1,143 +1,104 @@
-from __future__ import annotations
 import os
-import sys
-import json
-import uuid
-import hashlib
-import shutil
-from pathlib import Path
 import pandas as pd
-from typing import Iterable, List, Optional, Dict, Any
-import fitz  # PyMuPDF
-from langchain.schema import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+from dotenv import load_dotenv
+from typing import List
+from langchain_core.documents import Document
+from langchain_astradb import AstraDBVectorStore
 from utils.model_loader import ModelLoader
-from logger import GLOBAL_LOGGER as log
-from exception.custom_exception import DocumentPortalChatException
-from utils.file_io import generate_session_id, save_uploaded_files
-from utils.document_ops import load_documents
+from utils.config_loader import load_config
 
-SUPPORTED_EXTENSIONS = {".csv"}
-
-class FaissManager:
-    def __init__(self, index_dir: Path, model_loader: Optional[ModelLoader] = None):
-        self.index_dir = Path(index_dir)
-        self.index_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.meta_path = self.index_dir / "ingested_meta.json"
-        self._meta: Dict[str, Any] = {"rows": {}} ## this is dict of rows
-        
-        if self.meta_path.exists():
-            try:
-                self._meta = json.loads(self.meta_path.read_text(encoding="utf-8")) or {"rows": {}} # load it if alrady there
-            except Exception:
-                self._meta = {"rows": {}} # init the empty one if dones not exists
-        
-
-        self.model_loader = model_loader or ModelLoader()
-        self.emb = self.model_loader.load_embeddings()
-        self.vs: Optional[FAISS] = None
-        
-    def _exists(self)-> bool:
-        return (self.index_dir / "index.faiss").exists() and (self.index_dir / "index.pkl").exists()
-    
-    @staticmethod
-    def _fingerprint(text: str, md: Dict[str, Any]) -> str:
-        src = md.get("source") or md.get("file_path")
-        rid = md.get("row_id")
-        if src is not None:
-            return f"{src}::{'' if rid is None else rid}"
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
-    
-    def _save_meta(self):
-        self.meta_path.write_text(json.dumps(self._meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        
-        
-    def add_documents(self,docs: List[Document]):
-        
-        if self.vs is None:
-            raise RuntimeError("Call load_or_create() before add_documents_idempotent().")
-        
-        new_docs: List[Document] = []
-        
-        for d in docs:
-            
-            key = self._fingerprint(d.page_content, d.metadata or {})
-            if key in self._meta["rows"]:
-                continue
-            self._meta["rows"][key] = True
-            new_docs.append(d)
-            
-        if new_docs:
-            self.vs.add_documents(new_docs)
-            self.vs.save_local(str(self.index_dir))
-            self._save_meta()
-        return len(new_docs)
-    
-    def load_or_create(self,texts:Optional[List[str]]=None, metadatas: Optional[List[dict]] = None):
-        ## if we running first time then it will not go in this block
-        if self._exists():
-            self.vs = FAISS.load_local(
-                str(self.index_dir),
-                embeddings=self.emb,
-                allow_dangerous_deserialization=True,
-            )
-            return self.vs
-        
-        
-        if not texts:
-            raise DocumentPortalChatException("No existing FAISS index and no data to create one", sys)
-        self.vs = FAISS.from_texts(texts=texts, embedding=self.emb, metadatas=metadatas or [])
-        self.vs.save_local(str(self.index_dir))
-        return self.vs
-    
-class DocHandler:
+class DataIngestion:
     """
-    PDF save + read (page-wise) for analysis.
+    Class to handle data transformation and ingestion into AstraDB vector store.
     """
-    def __init__(self, data_dir: Optional[str] = None, session_id: Optional[str] = None):
-        self.data_dir = data_dir or os.getenv("DATA_STORAGE_PATH", os.path.join(os.getcwd(), "data", "single_document_chat"))
-        self.session_id = session_id or generate_session_id("session")
-        self.session_path = os.path.join(self.data_dir, self.session_id)
-        os.makedirs(self.session_path, exist_ok=True)
-        log.info("DocHandler initialized", session_id=self.session_id, session_path=self.session_path)
 
-    def save_csv(self, uploaded_file) -> str:
-        try:
-            filename = os.path.basename(uploaded_file.name)
-            if not filename.lower().endswith(".csv"):
-                raise ValueError("Invalid file type. Only CSVs are allowed.")
-            save_path = os.path.join(self.session_path, filename)
-            with open(save_path, "wb") as f:
-                if hasattr(uploaded_file, "read"):
-                    f.write(uploaded_file.read())
-                else:
-                    f.write(uploaded_file.getbuffer())
-            log.info("PDF saved successfully", file=filename, save_path=save_path, session_id=self.session_id)
-            return save_path
-        except Exception as e:
-            log.error("Failed to save PDF", error=str(e), session_id=self.session_id)
-            raise DocumentPortalChatException(f"Failed to save PDF: {str(e)}", e) from e
+    def __init__(self):
+        """
+        Initialize environment variables, embedding model, and set CSV file path.
+        """
+        print("Initializing DataIngestion pipeline...")
+        self.model_loader=ModelLoader()
+        self._load_env_variables()
+        self.csv_path = self._get_csv_path()
+        self.product_data = self._load_csv()
+        self.config=load_config()
 
-    def read_csv(self, csv_path: str) -> str:
-        try:
-            text_chunks = []
-            df = pd.read_csv(csv_path)
-            for idx, row in df.iterrows():
-                row_text = " | ".join([f"{col}: {row[col]}" for col in df.columns])
-                text_chunks.append(f"\n--- Row {idx + 1} ---\n{row_text}")
-                text = "\n".join(text_chunks)
-            log.info(
-                "CSV read successfully",
-                csv_path=csv_path,
-                session_id=self.session_id,
-                rows=len(text_chunks)
-            )
+    def _load_env_variables(self):
+        """
+        Load and validate required environment variables.
+        """
+        load_dotenv()
+        
+        required_vars = ["GOOGLE_API_KEY", "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN", "ASTRA_DB_KEYSPACE"]
+        
+        missing_vars = [var for var in required_vars if os.getenv(var) is None]
+        if missing_vars:
+            raise EnvironmentError(f"Missing environment variables: {missing_vars}")
+        
+        self.google_api_key = os.getenv("GOOGLE_API_KEY")
+        self.db_api_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
+        self.db_application_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+        self.db_keyspace = os.getenv("ASTRA_DB_KEYSPACE")
 
-            return text
-        except Exception as e:
-            log.error("Failed to read CSV", error=str(e), csv_path=csv_path, session_id=self.session_id)
-            raise DocumentPortalChatException(f"Failed to read CSV: {str(e)}", e) from e
+       
 
-    
+    def _get_csv_path(self):
+        """
+        Get path to the CSV file located inside 'data' folder.
+        """
+        current_dir = os.getcwd()
+        csv_path = os.path.join(current_dir,'data', 'product_reviews.csv')
+
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"CSV file not found at: {csv_path}")
+
+        return csv_path
+
+    def _load_csv(self):
+        """
+        Load product data from CSV.
+        """
+        df = pd.read_csv(self.csv_path)
+        expected_columns = {'product_id','product_title', 'rating', 'total_reviews','price', 'top_reviews'}
+
+        if not expected_columns.issubset(set(df.columns)):
+            raise ValueError(f"CSV must contain columns: {expected_columns}")
+
+        return df
+
+    def store_in_vector_db(self, documents: List[Document]):
+        """
+        Store documents into AstraDB vector store.
+        """
+        collection_name=self.config["astra_db"]["collection_name"]
+        vstore = AstraDBVectorStore(
+            embedding= self.model_loader.load_embeddings(),
+            collection_name=collection_name,
+            api_endpoint=self.db_api_endpoint,
+            token=self.db_application_token,
+            namespace=self.db_keyspace,
+        )
+
+        inserted_ids = vstore.add_documents(documents)
+        print(f"Successfully inserted {len(inserted_ids)} documents into AstraDB.")
+        return vstore, inserted_ids
+
+    def run_pipeline(self):
+        """
+        Run the full data ingestion pipeline: transform data and store into vector DB.
+        """
+        documents = self.transform_data()
+        vstore, _ = self.store_in_vector_db(documents)
+
+        #Optionally do a quick search
+        query = "Can you tell me the low budget iphone?"
+        results = vstore.similarity_search(query)
+
+        print(f"\nSample search results for query: '{query}'")
+        for res in results:
+            print(f"Content: {res.page_content}\nMetadata: {res.metadata}\n")
+
+# Run if this file is executed directly
+if __name__ == "__main__":
+    ingestion = DataIngestion()
+    ingestion.run_pipeline()

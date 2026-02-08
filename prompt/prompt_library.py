@@ -1,29 +1,45 @@
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from enum import Enum
+from typing import Dict
+import string
 
-# Prompt for contextual question rewriting
-contextualize_question_prompt = ChatPromptTemplate.from_messages([
-    ("system", (
-        "Given a conversation history and the most recent user query, rewrite the query as a standalone question "
-        "that makes sense without relying on the previous context. Do not provide an answer—only reformulate the "
-        "question if necessary; otherwise, return it unchanged."
-    )),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
 
-# Prompt for answering based on context
-context_qa_prompt = ChatPromptTemplate.from_messages([
-    ("system", (
-        "You are an assistant designed to answer questions using the provided context. Rely only on the retrieved "
-        "information to form your response. If the answer is not found in the context, respond with 'I don't know.' "
-        "Keep your answer concise and no longer than three sentences.\n\n{context}"
-    )),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
+class PromptType(str, Enum):
+    PRODUCT_BOT = "product_bot"
 
-# Central dictionary to register prompts
-PROMPT_REGISTRY = {
-    "contextualize_question": contextualize_question_prompt,
-    "context_qa": context_qa_prompt,
+class PromptTemplate:
+    def __init__(self, template: str, description: str = "", version: str = "v1"):
+        self.template = template.strip()
+        self.description = description
+        self.version = version
+
+    def format(self, **kwargs) -> str:
+        # Validate placeholders before formatting
+        missing = [
+            f for f in self.required_placeholders() if f not in kwargs
+        ]
+        if missing:
+            raise ValueError(f"Missing placeholders: {missing}")
+        return self.template.format(**kwargs)
+
+    def required_placeholders(self):
+        return [field_name for _, field_name, _, _ in string.Formatter().parse(self.template) if field_name]
+
+
+# Central Registry
+PROMPT_REGISTRY: Dict[PromptType, PromptTemplate] = {
+    PromptType.PRODUCT_BOT: PromptTemplate(
+        """
+        You are an expert product specialized in product recommendations and handling customer queries.
+        Analyze the provided product, category, return reason, cost, store name and date to provide accurate, helpful responses.
+        Stay relevant to the context, and keep your answers concise and informative.
+
+        CONTEXT:
+        {context}
+
+        QUESTION: {question}
+
+        YOUR ANSWER:
+        """,
+        description="Handles product details QnA & recommendation flows"
+    )
 }
