@@ -3,7 +3,7 @@ import sys
 import traceback
 from typing import Optional, cast
 
-class DocumentPortalException(Exception):
+class DocumentPortalChatException(Exception):
     def __init__(self, error_message, error_details: Optional[object] = None):
         # Normalize message
         if isinstance(error_message, BaseException):
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     try:
         a = 1 / 0
     except Exception as e:
-        raise DocumentPortalException("Division failed", e) from e
+        raise DocumentPortalChatException("Division failed", e) from e
 
     # Demo-2: still supports sys (old pattern)
     # try:
